@@ -1,0 +1,216 @@
+---
+- name: Replace swap partition with swapfile and grow root LV/filesystem (Ubuntu)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # ---- swapfile settings ----
+    swapfile_path: /swapfile
+    swapfile_size_gb: 20          # adjust as needed
+    swap_priority: 10
+
+    # ---- LVM settings (match your env) ----
+    vg_name: crypt
+    root_lv_name: root
+    swap_lv_name: swap
+    root_lv_device: "/dev/{{ vg_name }}/{{ root_lv_name }}"
+    swap_lv_device: "/dev/{{ vg_name }}/{{ swap_lv_name }}"
+    root_mapper_device: "/dev/mapper/{{ vg_name }}-{{ root_lv_name }}"
+
+  pre_tasks:
+    - name: Wait for apt/dpkg locks to be released
+      shell: |
+        set -e
+        for lock in /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock; do
+          if [ -e "$lock" ] && fuser "$lock" >/dev/null 2>&1; then
+            exit 1
+          fi
+        done
+      register: apt_locks
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: apt_locks.rc == 0
+
+    - name: Ensure dpkg is configured (clears half-configured state)
+      command: dpkg --configure -a
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        lock_timeout: 600
+
+    - name: Ensure required packages are present
+      apt:
+        name:
+          - lvm2
+          - e2fsprogs
+          - util-linux
+          - xfsprogs
+        state: present
+        lock_timeout: 600
+
+    - name: Detect root filesystem type
+      command: lsblk -no FSTYPE {{ root_mapper_device }}
+      register: root_fs_type
+      changed_when: false
+      failed_when: root_fs_type.rc not in [0, 32]
+
+  tasks:
+    - name: Disable all swap
+      command: swapoff -a
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure /dev/crypt/swap fstab entry is absent
+      mount:
+        src: "{{ swap_lv_device }}"
+        path: none
+        fstype: swap
+        state: absent
+
+    - name: Ensure /dev/mapper/crypt-swap fstab entry is absent
+      mount:
+        src: "/dev/mapper/{{ vg_name }}-{{ swap_lv_name }}"
+        path: none
+        fstype: swap
+        state: absent
+
+    # --- Create & initialize swapfile robustly ---
+    - name: Stat swapfile
+      stat:
+        path: "{{ swapfile_path }}"
+      register: swapfile_stat
+
+    - name: Compute desired swapfile size (bytes and MB)
+      set_fact:
+        swapfile_size_bytes: "{{ ((swapfile_size_gb | int) * 1024 * 1024 * 1024) | int }}"
+        swapfile_size_mb: "{{ ((swapfile_size_gb | int) * 1024) | int }}"
+
+    - name: Create swapfile with fallocate (fallback to dd) if missing
+      shell: |
+        set -e
+        if command -v fallocate >/dev/null 2>&1; then
+          fallocate -l {{ swapfile_size_bytes | int }} "{{ swapfile_path }}"
+        else
+          dd if=/dev/zero of="{{ swapfile_path }}" bs=1M count={{ swapfile_size_mb | int }} status=progress
+        fi
+      args:
+        creates: "{{ swapfile_path }}"
+      when: not swapfile_stat.stat.exists
+
+    - name: Ensure swapfile size matches (recreate if size differs)
+      shell: |
+        set -e
+        current="$(stat -c %s "{{ swapfile_path }}")"
+        if [ "$current" -ne "{{ swapfile_size_bytes | int }}" ]; then
+          swapoff "{{ swapfile_path }}" 2>/dev/null || true
+          rm -f "{{ swapfile_path }}"
+          if command -v fallocate >/dev/null 2>&1; then
+            fallocate -l {{ swapfile_size_bytes | int }} "{{ swapfile_path }}"
+          else
+            dd if=/dev/zero of="{{ swapfile_path }}" bs=1M count={{ swapfile_size_mb | int }} status=progress
+          fi
+        fi
+      register: recreate_swapfile
+      changed_when: recreate_swapfile.rc == 0
+      failed_when: recreate_swapfile.rc not in [0]
+
+    - name: Set 0600 permissions on swapfile
+      file:
+        path: "{{ swapfile_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Check if swapfile is already a swap area
+      shell: "blkid -p -s TYPE -o value {{ swapfile_path }} || true"
+      register: swapfile_type
+      changed_when: false
+
+    - name: Initialize swap area (mkswap) when needed
+      command: "mkswap {{ swapfile_path }}"
+      when: swapfile_type.stdout | lower != 'swap'
+
+    # --- Force exact fstab line: /swapfile swap swap sw,pri=10 0 0 ---
+    - name: Ensure swapfile fstab line uses 'swap' as the mountpoint (not 'none')
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^/swapfile\s+\S+\s+swap\s+'
+        line: "/swapfile swap swap sw,pri={{ swap_priority }} 0 0"
+        state: present
+        backup: yes
+        create: yes
+
+    - name: Remove duplicate /swapfile none swap line if present
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^/swapfile\s+none\s+swap\s+'
+        state: absent
+
+    - name: Check currently active swap devices
+      command: "swapon --show=NAME --noheadings"
+      register: swapon_list
+      changed_when: false
+
+    - name: Enable swapfile (swapon)
+      command: "swapon {{ swapfile_path }}"
+      when: swapon_list.stdout is not search('^{{ swapfile_path | regex_escape() }}$', multiline=True)
+
+    # --- Remove old LVM swap LV if it exists ---
+    - name: List logical volumes
+      command: lvs --noheadings -o lv_path
+      register: all_lvs
+      changed_when: false
+
+    - name: Remove LVM swap logical volume if present
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ swap_lv_name }}"
+        state: absent
+        force: true
+      when: (all_lvs.stdout is search(swap_lv_device))
+
+    # --- Extend root LV and grow filesystem ---
+    - name: Extend root LV to use all free space and resize fs
+      community.general.lvol:
+        vg: "{{ vg_name }}"
+        lv: "{{ root_lv_name }}"
+        size: +100%FREE
+        resizefs: true
+      register: lvol_extend
+
+    - name: Grow filesystem explicitly (ext4)
+      command: "resize2fs {{ root_lv_device }}"
+      when:
+        - root_fs_type.stdout | lower == 'ext4'
+      register: resize2fs_out
+      changed_when: "'resized' in (resize2fs_out.stdout + resize2fs_out.stderr) | lower"
+      failed_when: resize2fs_out.rc not in [0]
+
+    - name: Grow filesystem explicitly (xfs)
+      command: "xfs_growfs /"
+      when:
+        - root_fs_type.stdout | lower == 'xfs'
+
+    # --- Status / verification ---
+    - name: Show swap status
+      command: "swapon --show --bytes --noheadings --output NAME,TYPE,SIZE,PRIO"
+      register: swapon_show
+      changed_when: false
+
+    - name: Show LV sizes
+      command: "lvs -o vg_name,lv_name,lv_path,lv_size --units g --noheadings"
+      register: lvs_show
+      changed_when: false
+
+    - name: Summary
+      debug:
+        msg:
+          - "fstab line enforced: /swapfile swap swap sw,pri={{ swap_priority }} 0 0"
+          - "swapon: {{ swapon_show.stdout_lines | default([]) }}"
+          - "LVs: {{ lvs_show.stdout_lines | default([]) }}"
