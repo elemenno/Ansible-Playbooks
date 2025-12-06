@@ -1,0 +1,143 @@
+---
+- name: Install Slack on Ubuntu (APT repo | DEB URL | Snap)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Choose one: apt_repo | deb_url | snap
+    slack_install_method: apt_repo
+
+    # For apt_repo method
+    slack_apt_repo: "https://packagecloud.io/slacktechnologies/slack/debian"
+    slack_apt_dist: "jessie"   # Slack uses 'jessie' across Debian/Ubuntu derivatives
+    slack_key_url: "https://packagecloud.io/slacktechnologies/slack/gpgkey"
+    slack_keyring_path: "/etc/apt/keyrings/slacktechnologies_slack-archive-keyring.gpg"
+
+    # For deb_url method (pin a version)
+    # Check latest version on Slack’s downloads page; update the version below as needed
+    slack_version: "4.46.101"
+    slack_deb_url: "https://downloads.slack-edge.com/linux_releases/slack-desktop-{{ slack_version }}-amd64.deb"
+
+    # For snap method
+    snap_channel: "stable"
+    snap_classic: true
+
+  pre_tasks:
+    - name: Wait for apt/dpkg locks to be released
+      shell: |
+        set -e
+        for lock in /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock; do
+          if [ -e "$lock" ] && fuser "$lock" >/dev/null 2>&1; then
+            exit 1
+          fi
+        done
+      register: apt_locks
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: apt_locks.rc == 0
+      when: slack_install_method in ['apt_repo', 'deb_url']
+      tags: [apt]
+
+    - name: Ensure dpkg is configured (clears half-configured state)
+      command: dpkg --configure -a
+      changed_when: false
+      failed_when: false
+      when: slack_install_method in ['apt_repo', 'deb_url']
+      tags: [apt]
+
+    - name: Update apt cache (with lock timeout)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        lock_timeout: 600
+      when: slack_install_method in ['apt_repo', 'deb_url']
+      tags: [apt]
+
+  tasks:
+    - block:
+        - name: Ensure /etc/apt/keyrings exists
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+
+        - name: Install Slack APT signing key to keyring (dearmored)
+          shell: |
+            set -e
+            curl -fsSL "{{ slack_key_url }}" | gpg --dearmor -o "{{ slack_keyring_path }}.tmp"
+            chmod 0644 "{{ slack_keyring_path }}.tmp"
+            mv "{{ slack_keyring_path }}.tmp" "{{ slack_keyring_path }}"
+          args:
+            creates: "{{ slack_keyring_path }}"
+
+        - name: Add Slack APT repository (Packagecloud)
+          copy:
+            dest: /etc/apt/sources.list.d/slack.list
+            mode: '0644'
+            content: |
+              deb [arch=amd64 signed-by={{ slack_keyring_path }}] {{ slack_apt_repo }} {{ slack_apt_dist }} main
+
+        - name: apt update (Slack repo)
+          apt:
+            update_cache: yes
+            lock_timeout: 600
+
+        - name: Install Slack Desktop from APT
+          apt:
+            name: slack-desktop
+            state: present
+            lock_timeout: 600
+      when: slack_install_method == 'apt_repo'
+      tags: [apt, slack, repo]
+
+    - block:
+        - name: Install Slack from DEB URL (handles deps)
+          apt:
+            deb: "{{ slack_deb_url }}"
+            state: present
+            lock_timeout: 600
+      when: slack_install_method == 'deb_url'
+      tags: [apt, slack, deb]
+
+    - block:
+        - name: Ensure snapd is present
+          apt:
+            name: snapd
+            state: present
+            lock_timeout: 600
+
+        - name: Install Slack via Snap
+          community.general.snap:
+            name: slack
+            state: present
+            channel: "{{ snap_channel }}"
+            classic: "{{ snap_classic }}"
+      when: slack_install_method == 'snap'
+      tags: [snap, slack]
+
+    - name: Verify Slack is installed (any method)
+      shell: |
+        set -e
+        if command -v slack >/dev/null 2>&1; then
+          slack --version || true
+        elif command -v /usr/bin/slack >/dev/null 2>&1; then
+          /usr/bin/slack --version || true
+        elif snap list 2>/dev/null | grep -q '^slack '; then
+          snap list slack
+        else
+          exit 1
+        fi
+      register: slack_ver
+      changed_when: false
+      failed_when: slack_ver.rc != 0
+      tags: [verify, slack]
+
+    - name: Summary
+      debug:
+        msg:
+          - "Install method: {{ slack_install_method }}"
+          - "Verification output:"
+          - "{{ slack_ver.stdout_lines | default([]) }}"
+      tags: [verify, slack]
